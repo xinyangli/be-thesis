@@ -1,0 +1,249 @@
+
+% Chapter 2
+\chapter{仿真验证平台的搭建}
+
+\section{差分测试单元的实现} \label{section:difftest}
+
+\begin{figure}
+    \centering
+    \includegraphics{resources/diagrams-difftest.pdf}
+    \caption{差分测试流程图}
+    \label{fig:difftest}
+\end{figure}
+
+差分测试是一种基于协同仿真的验证框架，它通过逐指令对比，有效加速了芯片验证过程中的调试工作\cite{xuDevelopingHighPerformance2022}。差分测试的一个关键优势是其能够快速揭示参考模型与待测设备之间的行为差异，这对于在开发过程中及早发现设计缺陷极为重要。此外，差分测试通过提供指令级的错误定位，大大加快了芯片仿真的调试速度。如图~\ref{fig:difftest} 所示，本文采用的差分测试流程主要包括建立一个参考模型，并与待测设备一起逐周期运行，以此来验证芯片仿真的正确性。每执行完一条指令后，判别器将对比参考模型与芯片仿真的寄存器和内存状态。若状态出现不一致，则会中止RTL仿真并切换到调试界面。
+
+为了实现可定制化的差分测试，在芯片开发过程中逐步加入指令集支持，本文在仿真测试中将NEMU（见\ref{section:nemu}）作为参考模型，它的实现简单，修改容易，且性能足以满足一般程序的执行需求。
+
+本文选择了Verilator作为主要的仿真工具，这是因为Verilator具有诸多优势：Verilator 以其高性能著称，它将 HDL 代码编译成以周期进行行为建模（Cycle-accurate Behavioral Model）的C++ 代码，相比于传统仿真器基于时间建模的方式，它的仿真速度更快，非常适合在开发周期中进行大量的迭代测试；Verilator 支持多线程仿真，能够充分利用现代多核处理器的计算资源，在进行复杂的或者大规模的仿真时优势更为明显；Verilator 支持C++接口，仿真器和模拟器可以导出相同的接口，这降低了差分测试框架的开发难度。
+
+从图~\ref{fig:difftest} 可以看出，差分测试单元需要能够分别读写模拟器和仿真器的寄存器和内存，还需要能够单步执行。本文中将这些功能抽象成同一套接口（表~\ref{tab:difftest-api}），所有实现了这套接口的模拟器/仿真程序都可以接入差分测试，例如，本文为Spike\cite{RiscvsoftwaresrcRiscvisasim2023}也实现了这套接口，故也可以在NEMU和Spike之间完成差分测试，测试NEMU的实现是否正确。
+
+\begin{table}
+\centering
+\begin{tabular}{|l|p{10cm}|}
+\hline
+\textbf{命令} & \textbf{描述} \\
+\hline
+stepi & 在模拟器/仿真程序上执行一条指令。\\
+\hline
+read\_reg & 读取指定的寄存器内容。\\
+\hline
+write\_reg & 将数据写入指定寄存器。 \\
+\hline
+read\_mem & 读取由某一地址开始的一段内存。 \\
+\hline
+write\_mem & 写入由某一地址开始的一段内存。 \\
+\hline
+\end{tabular}
+\caption{差分测试接口}
+\label{tab:difftest-api}
+\end{table}
+
+在差分测试中，对内存和中断的检查需要特别处理。若在每个执行步骤都检查所有内存的一致性，将会大幅降低运行速度，因此仅在发生写入指令时检查写入地址的一致性。此外，由于中断可能导致执行一条指令后出现多种正确状态，为处理因中断引起的状态不同步，中断发生后需向参考模型同步状态。
+
+% 软件模拟器
+\section{RISC-V软件模拟器设计实现}\label{section:nemu}
+
+\begin{figure}
+    \centering
+    \includegraphics{resources/diagrams-nemu.drawio.pdf}
+    \caption{模拟器设计结构}
+    \label{fig:nemu}
+\end{figure}
+
+本文中的软件模拟器在南京大学的教学项目NEMU的基础上实现，原有项目仅提供了框架代码实现，需要自行实现指令解释、内存映射IO和中断处理。另外，为了便于调试，本文为NEMU添加了gdb远程调试的功能，可以使用gdb对模拟器上正在执行的程序进行调试。
+
+\subsection{指令解释器}
+
+指令解释器是软件模拟器的核心组件，其主要功能是解释指令，并对应修改模拟器的内部状态以模拟指令的执行效果。指令解释器可以被看作一个状态转移函数 $S_1 = \delta (S_0,D, Inst)$，其中 $S=(R_{pc},R_{csr},R_{g},M)$，$R_{pc}$ 是指令计数器，$R_{csr}$ 是异常寄存器，$R_g$ 是通用寄存器，$D$ 是设备，$M$ 是内存, $Inst$ 是从内存中读取到的指令。指令解释器的工作过程如算法~\ref{alg:interpreter} 所示。
+
+\SetKw{IS}{is}
+\begin{algorithm}
+    % Format
+    \DontPrintSemicolon
+    % Start
+    \KwData{$M_0$}
+    \Begin{
+        $R_{pc} \gets (80000000)_{16}$\;
+        $M \gets M_0$\;
+        \Repeat {Inst \IS EBREAK} {
+            $Inst \gets M[R_{pc}]$\;
+            $D \gets update\_device(D)$\;
+            $(R_{pc},R_{csr},R_{g},M) \gets \delta(R_{pc},R_{csr},R_{g},M),D,Inst)$\;
+        }
+    }
+    \caption{指令解释器}\label{alg:interpreter}
+\end{algorithm}
+
+状态转移函数 $\delta$ 是实现指令解释器的关键所在，它能够根据模拟器当前的状态和即将执行的指令来修改模拟器的内部状态。例如，如果指令是 \lstinline{add x3, x4, x5}，状态转移函数 $\delta$ 的返回值中，$R_{g}[5] \gets R_{g}[4] + R_{g}[3]$。
+
+\subsection{基于内存映射的设备模拟}
+
+内存映射输入输出（\textbf{M}emory-\textbf{m}apped \textbf{I}/\textbf{O}, MMIO），是一种用于处理器与外部设备通信的技术。在 MMIO 中，设备的寄存器被映射到处理器的内存地址空间中，通过读写这些地址来控制设备的操作和状态。RISC-V 架构采用 MMIO 方式访问外部设备。这意味着处理器可以通过读写特定的内存地址来与外部设备进行通信和控制。这种方式简化了系统设计，使得外部设备可以像访问内存一样进行访问，而无需特殊的输入输出指令。
+
+实现MMIO时，首先需要一种注册机制，即设备组件提供需要的地址范围以及处理程序，模拟器创建一个内存地址到设备的映射，之后所有对设备地址空间的访问都应该转发到对应设备组件的处理程序进行处理。注册函数的具体定义如下：
+
+\begin{lstlisting}[language=C]
+typedef void(*io_callback_t)(uint32_t offset, int len,
+                             bool is_write);
+void add_mmio_map(const char *name, paddr_t addr, void *space,
+                  uint32_t len，io_callback_t callback);
+\end{lstlisting}
+
+这个接口是由NEMU原有框架定义的，其中 \lstinline{addr} 和 \lstinline{len} 表示设备组件注册的地址范围，callback是在发生对 $[space, space+len)$ 范围内的访问请求时，应该被调用的处理程序。
+
+在实现设备处理后，还应该实现算法~\ref{alg:interpreter} 中的 \lstinline{device_update} 函数，这个函数在每条指令执行之前会更新外部设备的状态，相当于采用轮询的方式实现设备更新。
+
+本文中的模拟器实现了时钟、串口和键盘的模拟:
+
+\textbf{时钟设备}：时钟设备调用主机平台提供的时间接口来模拟RTC芯片。设备初始化时记录启动时间，处理MMIO调用时使用Linux系统中的 \lstinline{gettimeofday} 调用来获取当前时间。根据MMIO读取地址的不同，可以选择返回系统时间或真实时间。
+
+\textbf{串口设备}：串口设备用于处理器与外部设备之间的串行通信。模拟器将串口设备对应地址的内存写入请求转换为终端输出，从而在主机平台上实现显示功能。
+
+\textbf{键盘设备}：键盘设备模拟了i8042键盘控制器的工作过程，使用SDL库来获取键盘的通码和断码，将获取到的键盘码存入设备内部队列中。当CPU请求时，返回队首的键盘码。
+
+通过这种方式，模拟器可以模拟各种外部设备，并通过 MMIO 方式与处理器进行通信，从而实现对外部设备的模拟和控制。
+
+\subsection{自陷和异常处理}
+
+RISC-V中的中断分为三类：软件中断、时钟中断和外部中断。软件中断是由程序执行的特定指令序列主动引发的中断，主要用于实现系统调用、异常处理和调试功能。时钟中断由处理器的计时器产生，它可以帮助操作系统实现任务的定时执行，如调度多个进程或线程。外部中断则是由处理器外部的硬件设备发出的信号引起的，通常CPU的引脚与硬件中断控制器连接，外部设备通过中断控制器向CPU发送中断信号。
+
+在RISC-V中，中断依赖于一系列的控制和状态寄存器（\textbf{C}ontrol and \textbf{S}tatus \textbf{R}egisters, CSR）来管理，它们和常规寄存器相同，都需要保存在模拟器中。其中，最重要的有：
+\begin{itemize}
+    \item mstatus：保存和恢复异常发生前后的诸多状态。例如，它的MIE位用于全局启用或禁用中断。
+    \item mcause：用于记录引发异常的原因。
+    \item mtvec：异常处理程序的入口，可以设置为直接模式或向量模式，由最高位标识。直接模式下所有中断都会跳转到同一地址，由该地址的程序继续处理；向量模式会根据mcause的值线性映射跳转地址。
+    \item mtval：记录异常发生时的额外信息。例如，在地址异常的情况下，会保存发生错误的具体地址；若是非法指令异常，则会记录引起异常的指令本身。
+    \item mepc: 保存发生错误时指令的地址，用于在结束异常处理后返回到程序发生异常的位置。
+\end{itemize}
+
+本文中的模拟器采用轮询的方式对键盘、时钟等设备状态进行更新，没有实现RISC-V架构的平台级中断控制器（\textbf{P}latform-\textbf{L}evel \textbf{I}nterrupt \textbf{C}ontroller, PLIC），故不支持外部中断。因此，主要需要实现的是软件中断。一方面，模拟器需要向上层提供操作CSR寄存器的指令 \lstinline{csrr} 和\lstinline{csrw}，它们的实现与常规的寄存器读写指令类似，仅仅是目的寄存器不同；另一方面，模拟器需要按照RISC-V手册\cite{watermanRISCVInstructionSet2011}正确实现异常处理的流程，并在正确的位置调用此处理流程。中断处理的流程对于所有异常都是相同的，因此将其封装为函数 \lstinline{isa_raise_intr}。
+
+RISC-V的异常处理流程可以分为三步进行：
+
+\begin{enumerate}
+    \item 当异常发生时，根据异常的类型设置 mcause 寄存器。如果当前的异常类型需要额外信息，则将它们记录到 mtval 寄存器中。
+    \item 将程序计数器保存在 \lstinline{mepc} 中。
+    \item 根据 \lstinline{mtvec} 的设置，跳转到对应的异常处理函数。
+\end{enumerate}
+
+\section{GDB远程调试实现}
+
+
+
+使用GDB进行本地调试时，GDB和待调试程序运行在同一内存空间上，GDB通过在程序中注入中断指令，并依赖操作系统的调度实现调试。运行在模拟器上的程序想要支持这种调试方式是非常困难的，它要求模拟器能正确运行GDB与操作系统。因此，为模拟器支持GDB远程串口协议（GDB Remote Serial Protocol）是更加合理的选择。
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\textwidth]{resources/diagrams-gdbstub.pdf}
+    \caption{GDB 远程调试原理}
+    \label{fig:gdbremote}
+\end{figure}
+
+GDB远程串口协议的工作过程如图~\ref{fig:gdbremote} 所示。该协议允许GDB通过套接字或TCP连接到模拟器上的调试桩（GDB Stub）服务器，他们之间的通信遵循GDB远程串口协议。GDB可以通过GDB Stub发送命令到模拟器执行，模拟器在执行后再将结果传回GDB客户端，以此实现对虚拟机中运行的程序的控制和调试。想要让模拟器支持GDB远程调试，就需要实现一个能够通过网络响应GDB远程串口协议的调试桩。这个调试桩负责处理GDB发送的各种指令，比如设置断点、步过指令、读写内存等。
+ 
+\begin{table}
+\centering
+\begin{tabular}{|l|p{10cm}|}
+\hline
+\textbf{命令} & \textbf{描述} \\
+\hline
+cont & 运行模拟器/仿真直到遇到断点或退出。 \\
+\hline
+set\_bp & 在指定内存地址设置断点或监视点。 \\
+\hline
+del\_bp & 删除指定地址上的断点或监视点。 \\
+\hline
+\end{tabular}
+\caption{GDB远程调试接口}
+\label{tab:gdbstub-api}
+\end{table}
+
+本文中需要为三个组件实现调试功能：NEMU，芯片仿真程序和差分测试单元。其中，NEMU和芯片仿真程序都已经实现了如表~\ref{tab:difftest-api} 所示的API用于差分测试。差分测试的API实现的功能就是处理器状态的同步，故可以在这里被复用。不过还需要补充如表~\ref{tab:gdbstub-api} 所示的API，便于gdbstub的实现。为了支持GDB stub的功能，本文基于开源项目mini-gdbstub开发了一个库，该库基于以上8个接口，通过套接字响应GDB客户端的请求。只需要将NEMU、差分测试模块或芯片仿真与这个库链接，即可使用GDB连接并进行远程调试。
+
+\section{交叉编译环境搭建}
+
+\subsection{硬件抽象层设计}
+
+不同平台上的设备实现会有一定的差异，例如，在模拟器中，时间是通过宿主机系统调用获取的，而在片上系统中，则是通过总线从时钟芯片上获取。硬件抽象层的目的就是屏蔽不同平台上设备访问的差异，让同样的用户程序能够在不同的平台上运行。现代操作系统都提供了这种硬件抽象的功能，用户程序通过系统调用来访问硬件资源（图~\ref{fig:2-machines-os}），操作系统中的驱动程序会响应用户请求，并完成对应的任务。在芯片支持操作系统启动之前，所有的用户程序都需要直接运行在裸机上，这些程序的调用结构如图~\ref{fig:2-machines-bm} 所示。硬件抽象层作为一个库，以链接的方式向上层用户程序提供设备访问的接口。硬件抽象库在不同平台上的具体实现可以不同，但都向用户程序提供相同的接口，从而保证了用户程序在这些平台上的可迁移性。
+
+本文基于开源项目abstract-machine提供的接口标准，实现了NEMU和硬件仿真环境下的硬件抽象库。同时本文改进abstract-machine的编译系统，从Makefile升级到了CMake，使其能够同时被编译成满足多平台使用的软件库。基于abstract-machine上的程序只需要将这个库添加到依赖中，即可完成一个运行与NEMU或者芯片仿真环境上的程序。
+
+% 实现！
+\begin{figure}
+\centering
+
+\begin{minipage}[t]{0.35\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{../resources/machine-with-os.drawio.pdf}
+    \subcaption{操作系统上运行的应用程序}
+    \label{fig:2-machines-os}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.35\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{../resources/machine-bare-metal.drawio.pdf}
+    \subcaption{裸机上运行的应用程序}
+    \label{fig:2-machines-bm}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.15\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{../resources/machine-legend.drawio.pdf}
+    \hfill
+\end{minipage}
+\caption{不同层级的硬件抽象层}
+\label{fig:2-machines}
+\end{figure}
+
+\subsection{交叉编译工具}
+
+
+交叉编译涉及一系列编译工具，包括编译器、汇编器和链接器等，其目的是将源代码从高级编程语言转换为特定硬件架构的二进制执行代码。考虑到市场上尚未普及具备RISC-V架构的个人主机，开发者通常需在X86或ARM架构的计算平台上构建交叉编译环境，从而生成适用于RISC-V架构的二进制代码。此举使得开发者能够在不同的硬件平台上编译和测试针对RISC-V指令集优化的应用程序。
+
+适用于敏捷芯片开发的交叉编译工具链主要需要解决两个问题：首先，为成熟的RISC-V芯片编译程序时，芯片支持的指令集不会发生变化，因此，只需要输出针对一个特定平台的二进制代码。但是在芯片开发的过程中，芯片的指令集支持是被逐步添加到芯片中的。编译系统需要针对当前芯片支持的指令集扩展优化并产出二进制代码。例如，在支持RISC-V的乘除法指令（M扩展）之前，编译器需要使用libgcc中的软乘法来代替乘除法指令。为了建立芯片回归测试集，编译系统需要同时产生所有阶段测试所需的二进制程序。
+
+其次，对于依赖其他库的复杂程序而言，跨架构的依赖管理非常复杂。在一般的Linux发行版中，这些依赖库通常只有能够运行在较全功能芯片上的版本。以Debian为例，RISC-V的移植仅支持RV64GC，这意味着如果要在Debian上交叉编译一个支持RV32IM的二进制程序，那么程序依赖的所有库都需要手动重新编译、链接。而本文中的模拟器NEMU就需要管理跨架构的依赖关系，因为模拟器本身运行在X86系统上，而其中运行的程序的目标平台则为RV32I,RV32IM或RV64GC等架构，图~\ref{fig:cross-compile} 展示了NEMU的依赖关系图,其中蓝色部分是RISC-V架构的依赖，am-kernels是基于abstract-machine的一系列测试程序，将用于后续章节的测试中。
+
+为了以上问题，本文搭建了一个基于Nix和Nixpkgs的系统来管理交叉编译和软件依赖。Nix是一个功能强大的包管理器，它使用一种函数式语言来管理软件包的构建过程，确保构建过程中的隔离性和可复现型。Nixpkgs是Nix的官方包仓库，其中包含了超过 $90000$ 个软件包，并且有超过 $90\%$ 的包都是最新的。相比于其他的包管理工具，Nix原生支持交叉编译，这意味着Nixpkgs所包含的所有软件包都可以在理论上被交叉编译到任意平台。
+
+代码~\ref{lst:nix} 展示了使用Nix管理NEMU依赖的方法，其中，如果将gcc.arch从rv32if替换成rv64gc，即可直接编译64位RISC-V的可执行程序，完全不需要修改其他部分。
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\textwidth]{resources/diagrams-cross-compile.pdf}
+    \caption{使用Nix管理不同架构下的依赖关系}
+    \label{fig:cross-compile}
+\end{figure}
+
+\begin{lstlisting}[label={lst:nix},captionpos=b,caption={使用Nix管理跨架构依赖}]
+let pkgs = import nixpkgs { inherit system; };
+crossPkgs = import nixpkgs {
+  localSystem = system;
+  crossSystem = {
+    ...
+    gcc = { abi = "ilp32"; arch = "rv32if"; };
+  };
+}; in
+{
+  am-kernels = crossPkgs.stdenv.mkDerivation ./am-kernels
+  nemu = pkgs.callPackage ./nemu { 
+    am-kernels = self.packages.${system}.am-kernels;
+  };
+}
+\end{lstlisting}
+
+\section{本章小结}
+
+本章节系统地介绍了仿真验证平台的搭建，重点分析了差分测试单元的实现和RISC-V软件模拟器的设计与实现。
+
+本文将差分测试引入了芯片前期验证环节，该方法通过比较参考模型与待测设备的指令执行结果，有效地加速了芯片验证过程中的调试工作。本研究选用Verilator作为仿真工具，其高性能和多线程的特性显著提升了仿真测试的效率和规模。差分测试框架的接口设计允许不同的模拟器和仿真程序进行接入，可以对应用进行更广泛地测试。
+
+关于RISC-V软件模拟器的设计与实现，本研究在开源项目NEMU的基础上进行了扩展，增加了指令解释、内存映射IO和中断处理等关键功能。模拟器采用内存映射输入输出（MMIO）的方式来模拟外部设备，如时钟、串口和键盘，有效地实现了设备的模拟与控制。
+
+这一章节还讨论了通过GDB的远程串口协议实现的远程调试功能。通过实现 gdbstub 库，NEMU、芯片仿真以及差分测试模块可以更加便捷地被调试。
+
+最后，本章节详述了针对RISC-V架构的交叉编译环境的搭建。通过使用Nix建立的交叉编译环境，能够在不同硬件平台上编译和测试针对RISC-V指令集优化的应用程序，有效支持了芯片开发过程中的软件开发和测试。
+
+通过上述各部分的详细阐述，本章节展示了在芯片设计与开发过程中，如何利用高效的工具和方法来优化仿真测试和远程调试，以确保设计的正确性和提升开发效率。

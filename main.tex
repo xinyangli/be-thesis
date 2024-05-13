@@ -1,0 +1,66 @@
+\documentclass[type = bachelor]{whu-thesis}
+% \documentclass[type = master]{whu-thesis}
+% \documentclass[type = doctor]{whu-thesis}
+% \documentclass[type = master,showframe]{whu-thesis}
+% \documentclass[type = doctor,showframe]{whu-thesis}
+% \documentclass[type = bachelor,showframe]{whu-thesis}\small
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{listings}
+\usepackage{graphicx}
+\usepackage{algorithm2e}
+\renewcommand{\lstlistingname}{代码}
+\renewcommand{\algorithmcfname}{算法}
+% \setmonofont{TeX Gyre Cursor}
+\lstset{basicstyle=\ttfamily\small}
+\whusetup{
+  info = {
+    title      = {基于RISC-V的CPU设计},
+    department = {国家网络安全学院},
+    author     = {李心杨},
+    student-id = {2020302181022},
+    supervisor = {涂国庆},
+    academic-title = {副教授},
+    major   = {信息安全},
+    year = 2024,
+    month = 5,
+    clc = O175.29,
+    udc = 517.9,
+    keywords = {RISC-V,敏捷开发,处理器设计,差分测试},
+    keywords* = {RISC-V,Agile Development,Processor Design,Differential testing}
+  },
+  style = {
+    % footnote-style = libertinus-sans,
+    font = times,
+    math-font = termes,
+    cjk-font = fandol,
+    % library,
+    % cjk-fakefont = true,
+    bib-backend = bibtex,
+    % bib-style = numerical,
+    bib-resource = {ref/RISCV}
+  }
+}
+\whumodule{cse}
+\begin{document}
+
+\tableofcontents
+% \listoffigures
+% \listoftables
+
+\mainmatter
+
+%%----------- 主体部分 ----------- %%
+\include{pages/chapter1}
+\include{pages/chapter2}
+\include{pages/chapter3}
+\include{pages/chapter4}
+\include{pages/chapter5}
+
+\clearpage
+
+\bibliography{ref/RISCV}
+
+\include{pages/thanks}    % 致谢
+\end{document}
+
