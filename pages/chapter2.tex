@@ -1,0 +1,217 @@
+% Chapter 3
+
+\chapter{基于消息控制的处理器设计}
+
+\section{基于消息控制的处理器设计概述}
+
+在教学中设计的处理器一般采用集中式控制的架构\cite{pattersonComputerOrganizationDesign2017}，即整个处理器由一个集中式的控制器进行控制，这样设计便于理解，也更容易实现。但是这样做的缺点在于难以扩展：首先，从单周期设计升级到多周期、流水线时需要修改大量代码，甚至直接重写；其次，如果想在处理器中添加一个新阶段，则需要重写控制器。为了解决以上问题，本文引入了基于消息控制的处理器结构。
+
+基于消息控制的处理器在处理器的各个单元之间加入了read, valid两个信号，用于控制信息在单元间的传递。Ready-Valid接口是一种常用的通信协议，通过ready和valid信号来同步不同部件之间的数据传输。发送方通过valid信号表明其发送的数据是有效的，可以被接收方读取。接收方通过ready信号表明其准备好接收数据。当且仅当ready, valid均为高电平时，发送方和接收方之间握手成功，消息被成功传递。
+
+基于消息控制的处理器本质上是在各个阶段之间采用“握手”的方式进行消息传递，对于不同架构的处理器而言，握手的频率不同：
+
+\begin{itemize}
+    \item 单周期处理器中，read和valid始终为高电平，所以消息在每一周期都可以从取指阶段传递到写回阶段。
+    \item 多周期处理器中，只存在一个正在执行的单元，因此同一时刻仅会有一个单元将valid置为高电平。当然，假设正在执行的单元需要多于一个周期完成（例如SDRAM有访存延时），则所有单元间valid信号均为低电平。只有当写回单元结束执行后，取指单元才会再取出新的指令。
+    \item 流水线处理器中，每个模块只要完成执行，就会一直尝试向下游模块发送消息。
+\end{itemize}
+
+因此，基于消息的处理器更容易进行架构升级，主要修改各个单元之间连接的方式和握手信号的处理即可。
+
+图~\ref{fig:handshake} 是多周期处理器两个单元间握手的一个例子。在a-b段，IDU和EXU完成握手，消息从IDU发送到EXU。在b-c段，EXU完成执行，将valid设为高电平，此时EXE/WB.ready也高电平，说明EXU和MEM握手成功，所以MEM接收了EXU的执行结果。在c-d段，将ready设为低电平表示此时访存模块正在工作，不能接收上游模块的消息。
+
+消息控制是分布式的，每个单元只需要关注内部实现和外部接口。采用分布式架构后，控制单元也可以被切分到各个单元内部，如图~\ref{fig:handshake} 所示。分布式的控制器仅需要产生所在单元需要的控制信号，这大大降低了其复杂度，增加了控制器的可维护性，且便于控制器的优化。
+
+\begin{figure}
+    \centering
+    \includegraphics{resources/diagrams-datapath.pdf}
+    \caption{处理器数据通路设计}
+    \label{fig:my_label}
+\end{figure}
+
+\begin{figure}
+    \centering
+    \includegraphics{resources/diagrams-handshake.pdf}
+    \caption{多周期处理器中的握手波形图}
+    \label{fig:handshake}
+\end{figure}
+
+\section{处理器各阶段设计与实现}
+
+本项目中处理器为四级流水结构：取指、译码、执行和写回。本节将逐一对流水线中各个单元的主要数据通路和控制通路进行说明，对于流水线冲突的处理则会放在\ref{sec:hazard} 进行单独说明。
+
+\subsection{取指阶段的设计}
+
+\begin{figure}
+    \centering
+    \includegraphics{resources/diagrams-IFU.pdf}
+    \caption{取指阶段设计图}
+    \label{fig:stage-if}
+\end{figure}
+
+取指单元主要负责从内存中按照程序计数器指示的地址获取指令，将其送往后续的单元。在后续单元没有阻塞的情况下，程序计数器每个周期都会被更新。程序计数器的更新来源由执行阶段分支模块的输出决定：当分支指令发生跳转时，程序计数器被更新为跳转指令的目的地址（branchAddr或jmpAddr）；当分支指令的条件未满足，或者执行阶段当前未执行跳转类指令时，PC的值自增4。
+
+% TODO: 总线导致的延迟？WB->IF的写回需不需要ready-valid？
+
+\subsection{译码阶段的实现}
+
+\begin{figure}
+    \centering
+    \includegraphics{resources/diagrams-IDU.pdf}
+    \caption{译码阶段设计图}
+    \label{fig:stage-id}
+\end{figure}
+
+译码单元根据指令解析出控制信号，顺流水线向下传递。同时，通用寄存器堆也在ID级。译码单元根据指令中的rs1（15至19位）和rs2（20至24位），从通用寄存器堆中获取对应的寄存器值，送入下级流水线。计分板用于处理数据冒险，具体实现见 \ref{sec:scoreboard}。
+
+这里值得一提的是在Chisel下控制模块的实现。控制单元属于组合电路，其核心逻辑是一张真值表。维护这张真值表同时保证其扩展性是个工程上的挑战，对于Verilog，常用的写法如代码~\ref{lst:cu-verilog} 所示。首先，Verilog赋值时没有类型检查，这很容易导致在控制信号过多以后产生混淆。其次，使用always语句会将优化推迟到综合阶段，不同的综合器的优化能力不同，其优化结果难以保证。Chisel维护真值表时，可以为每个控制信号新定义一个类，这样即使是同为 3'b10，其语义也不同。当 \lstinline{aSrcAZero} 被错误赋值给了 \lstinline{aluSrcB} 时，或者给某个信号赋了错误宽度的值时，Chisel会在编译期报错，提早发现错误。另外，本文在实现控制单元时使用了Chisel的实验性功能：decode和TruthTable，TruthTable用于定义一张真值表，decode用于将TruthTable转为电路，并在这个过程中使用ESPRESSO Ⅱ\cite{braytonEspressoIIMinimizationLoop1984}算法进行状态化简。在编译器进行状态化简保证了优化的稳定性。
+
+\begin{lstlisting}[language=verilog,captionpos=b,caption={Verilog实现控制单元},label={lst:cu-verilog}]
+case(op)
+  INST_ADD:
+    begin aluSrcA = 3'b10; ...
+    end
+endcase
+\end{lstlisting}
+
+\begin{lstlisting}[language=scala,captionpos=b,caption={Chisel实现控制单元},label={lst:cu-verilog}]
+class ALUControlInterface extends Bundle {
+  object SrcASelect extends ChiselEnum {
+    val aSrcARs1, aSrcAPc, aSrcAZero = Value
+  }
+  ...
+  val srcASelect = Input(SrcASelect())
+  def ctrlBindPorts = {
+    op :: srcASelect :: srcBSelect :: signExt :: HNil
+  }
+}
+\end{lstlisting}
+
+\subsection{执行阶段的实现}
+
+
+执行单元是所有单元中设计最复杂的，它包含了ALU，访存和分支控制。ALU中包含了位移、加减法和逻辑比较单元。
+
+对于整数计算指令，ALU负责计算任务，其具体执行的操作由上一步译码单元解析出的 \lstinline{ALUop} 决定。ALU除了输出执行结果以外，还会额外输出两个操作数是否相等。整数计算指令的结果直接传到下一级写回单元，不做额外处理。对于无条件分支指令（\lstinline{jal}, \lstinline{jalr}），ALU负责跳转地址计算。分支控制单元不对无跳转指令做处理，而是直接通过 \lstinline{jmpAddr} 传回取指级。对于条件分支指令，ALU用于比较两个操作数的大小关系，分支控制根据ALU结果和分支指令来判断是否进行跳转。在RISC-V中，指令的第12、14位加上两个操作数比较的结果即可得出分支是否跳转。另外，由于条件分支指令也需要偏移，因此在分支控制单元内部还需要一个加法器计算偏移后的分支地址。
+
+对于内存读写指令，ALU的功能是计算内存地址。执行单元通过AXI总线访问内存。由于RISC-V采用MMIO的方式进行设备访问，故这里内存读写指令同样可以实现设备访问。从AXI4总线获取到的内存值缓存在Load reg中，后续发送到下一级流水线单元。
+
+\begin{figure}
+    \centering
+    \includegraphics{resources/diagrams-EXU.pdf}
+    \caption{执行阶段设计图}
+    \label{fig:stage-exe}
+\end{figure}
+\subsection{写回阶段的实现}
+
+写回单元的结构非常简单，主要就是将上一级的数据写回到寄存器堆中。写回单元需要与计分板交互，在写入后将计分板上目的寄存器对应的比特置为低电平。
+
+\section{流水线冒险处理} \label{sec:hazard}
+
+\subsection{结构冒险}
+
+本文没有选择采用哈佛架构，而是选择使用了冯诺依曼架构，即指令存储器和数据存储器位于同一地址空间。因此，执行单元和访存单元之间存在结构冒险。本文中所有访存都通过AXI总线完成，内存和设备前的仲裁器优先满足取指单元的请求。执行单元在未获取到数据内存的情况下会将 \lstinline{ready} 信号置为低电平，阻塞流水线，以此解决了结构冒险。
+
+\subsection{基于记分板的数据冒险处理} \label{sec:scoreboard}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=7cm]{resources/diagrams-scoreboard.pdf}
+    \caption{计分板单元}
+    \label{fig:scoreboard}
+\end{figure}
+
+计分板算法最早由 \citeauthor{thorntonParallelOperationControl1964} 提出\cite{thorntonParallelOperationControl1964}，其核心思想是利用硬件来动态解决数据冒险：操作寄存器之前对其进行标记，在完成操作后解除标记。如果在标记寄存器前发现其正处于被标记的状态，则证明存在数据冒险。
+
+本文中的处理器是顺序流水结构，不存在读后写（RAW）和写后写(WAW) 冒险，仅需要考虑写后读类型的数据冒险。对内存的读写都发生在执行单元内部，不会发生数据冒险；对寄存器堆的读写分别发生在译码阶段和写回阶段，有可能发生数据冒险。
+
+计分板内部用一位标记对应寄存器是否将要被写入，因此计分板内部的核心部件是一个32位寄存器，每一位对应着一个寄存器是否正处于待写状态。\lstinline{rdFinish} 表示写回单元将要写入的寄存器，它对应的寄存器位将会被更新为低电平，表示该寄存器的写入已经完成；\lstinline{rdPending} 表示译码单元中的指令将会写入的寄存器，它对应的寄存器位将会被置为高电平，表示寄存器将在写回单元被写入。\lstinline{rs1} 和 \lstinline{rs2} 表示两个操作数寄存器，用于检查当前指令读取的寄存器是否即将被写入。它们的值经过独热编码器（One-Hot Encoding）后，与寄存器当前值经过与门，连接到计分板的输出上。由于RISC-V中的0号寄存器是只读的，因此我们不需要维护其写入状态，可以在经过One-Hot编码器后使最低位恒为0。
+
+\subsection{控制冒险}
+
+控制冒险是流水线处理器中由于跳转和分支指令引起的执行序列不确定性问题。本文中，分支指令的跳转地址在执行级才能计算得出，因此存在控制冒险，如图~\ref{fig:controlhazard} 所示。为了实现简单，本文采用了预测分支总是发生的策略，总是线获取跳转指令后的指令执行。
+
+假设分支发生了跳转，那么第二条指令的取指单元所获取的指令是错误的。在发生了这种控制冒险时，应该清空解码单元和执行单元正在执行的指令。只要将IF/EX.valid置为0，就可以实现清空执行单元指令的目的。
+
+\begin{figure}
+    \centering
+    \includegraphics{resources/diagrams-controlhazard.pdf}
+    \caption{控制冒险}
+    \label{fig:controlhazard}
+\end{figure}
+
+\section{总线实现与片上连接}
+
+\subsection{AXI4-Lite协议实现}
+
+本文采用 AXI4-Lite 协议作为总线连接，它是一种简化版本的 AXI 协议，专门为简单、低成本的连接而设计。AXI4-Lite 通过减少通道的数量和信号的复杂性，简化了硬件设计，同时保持了与更复杂的 AXI4 协议的兼容性。本协议包括两个主要通道：读通道和写通道，其信号定义如表~\ref{tab:axi4-read}和表~\ref{tab:axi4-write}所示。
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l | p{10cm}|}
+\hline
+\textbf{信号} & \textbf{描述} \\
+\hline
+ARVALID & 读地址有效，表明主机提供了有效的读地址 \\
+\hline
+ARADDR  & 读地址，由主机提供，指定读操作的地址 \\
+\hline
+ARREADY & 读地址就绪，表明从机已准备好接收地址 \\
+\hline
+RDATA   & 读数据，从机提供的数据 \\
+\hline
+RVALID  & 读有效，表明从机提供了有效的读数据 \\
+\hline
+RREADY  & 读就绪，表明主机已准备好接收数据 \\
+\hline
+\end{tabular}
+\caption{AXI4-Lite 读通道信号} \label{tab:axi4-read}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l | p{10cm}|}
+\hline
+\textbf{信号} & \textbf{描述} \\
+\hline
+AWVALID & 写地址有效，表明主机提供了有效的写地址 \\
+\hline
+AWADDR  & 写地址，由主机提供，指定写操作的地址 \\
+\hline
+AWREADY & 写地址就绪，表明从机已准备好接收地址 \\
+\hline
+WDATA   & 写数据，主机提供的数据 \\
+\hline
+WVALID  & 写有效，表明主机提供了有效的写数据 \\
+\hline
+WREADY  & 写就绪，表明从机已准备好接收数据 \\
+\hline
+BRESP   & 写响应，从机提供的操作状态反馈 \\
+\hline
+BVALID  & 写响应有效，表明从机提供了有效的写响应 \\
+\hline
+BREADY  & 写响应就绪，表明主机已准备好接收响应 \\
+\hline
+\end{tabular}
+\caption{AXI4-Lite 写通道信号}\label{tab:axi4-write}
+\end{table}
+
+\subsection{基于DPI-C的设备模拟}
+
+\begin{figure}
+    \centering
+    \includegraphics{resources/diagrams-dpi.pdf}
+    \caption{DPI-C调用流程}
+    \label{fig:my_label}
+\end{figure}
+DPI-C（Design Programming Interface for C）\cite{IEEEStandardSystemVerilog2005} 是一种接口标准，用于C/C++程序和硬件描述语言模型之间的交互。DPI-C允许开发者在仿真环境中嵌入和执行C或C++代码，以便进行更为复杂或者高级的模拟计算，增强测试和验证的灵活性和效率。本文加入了一个名为DPI的硬件模块，其功能就是将处理器通过AXI总线发送的对内存的访问请求转化为对C代码的DPI-C接口调用。通过这种方法，处理器仿真环境可以和NEMU共享同一套设备模拟，减少了开发工作量，同时也保证在设备SoC连接之前就可以看到CPU的执行效果。
+
+\section{本章小结}
+
+本章探讨了基于消息控制的处理器设计，这种设计相比传统的集中式控制架构，提供了更好的可扩展性和灵活性。通过引入Ready-Valid接口，处理器的各个单元能够通过一种有效的握手机制进行通信，从而解决了传统处理器在扩展时面临的重写控制器的问题。
+
+本章详细阐述了基于消息控制的处理器架构在不同处理器设计（单周期、多周期、流水线）中的应用。这种架构使得处理器设计更加模块化，每个处理单元可以独立控制其内部操作和外部通信，显著降低了系统的复杂性。
+
+在处理器各阶段的设计与实现中，本章逐一介绍了取指、译码、执行和写回阶段的具体设计和实现问题，以及这些设计如何通过使用消息控制方式来优化数据流和控制流的处理效率。此外，本章还探讨了流水线冒险的处理方法，包括结构冒险、数据冒险和控制冒险的解决策略，以及如何通过计分板算法动态解决数据冒险。
+
+最后，本章介绍了总线实现和片上连接技术，特别是AXI4-Lite协议的应用，以及如何通过DPI-C接口在仿真环境中嵌入C/C++代码来增强处理器设计的测试和验证能力。

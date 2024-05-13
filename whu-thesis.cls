@@ -101,6 +101,7 @@
 \dim_new:N \l__whu_tmpa_dim
 \dim_new:N \l__whu_tmpb_dim
 \dim_new:N \l__whu_tmpc_dim
+\cs_generate_variant:Nn \tl_if_eq:nnTF { V }
 
 \hook_gset_rule:nnnn { begindocument/before } { . } { < } { xeCJK }
 
